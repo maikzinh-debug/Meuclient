@@ -5,10 +5,12 @@ import net.minecraft.client.gui.GuiButton;
 import net.minecraft.client.gui.GuiScreen;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.client.shader.Framebuffer;
 import net.minecraftforge.client.event.FOVUpdateEvent;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
 import net.minecraftforge.common.MinecraftForge;
@@ -37,7 +39,7 @@ import java.io.IOException;
  *
  * Menu: Shift direito (abre e fecha)
  */
-@Mod(modid = "meuclient", name = "Meu Client", version = "1.1", clientSideOnly = true)
+@Mod(modid = "meuclient", name = "Meu Client", version = "1.2", clientSideOnly = true)
 public class MeuClient {
 
     // ===== Estado dos modulos =====
@@ -54,10 +56,12 @@ public class MeuClient {
     private static float gammaSalvo = -1f;
 
     // ===== Motion blur (estado interno) =====
-    private static int blurTex = -1;
+    private static Framebuffer blurFbo = null;   // metodo 1 (framebuffer)
+    private static int blurTex = -1;             // metodo 2 (copia de textura)
     private static int blurW = 0;
     private static int blurH = 0;
     private static boolean blurPronto = false;
+    private static String blurModo = "-";
 
     // ===== Teclas =====
     public static KeyBinding menuKey;
@@ -137,13 +141,86 @@ public class MeuClient {
         aplicarMotionBlur(mc);
     }
 
+    private static void desenharQuad(int sw, int sh) {
+        Tessellator tess = Tessellator.getInstance();
+        WorldRenderer wr = tess.getWorldRenderer();
+        wr.begin(7, DefaultVertexFormats.POSITION_TEX);
+        wr.pos(0, sh, 0).tex(0, 0).endVertex();
+        wr.pos(sw, sh, 0).tex(1, 0).endVertex();
+        wr.pos(sw, 0, 0).tex(1, 1).endVertex();
+        wr.pos(0, 0, 0).tex(0, 1).endVertex();
+        tess.draw();
+    }
+
     private static void aplicarMotionBlur(Minecraft mc) {
         int w = mc.displayWidth;
         int h = mc.displayHeight;
+        ScaledResolution sr = new ScaledResolution(mc);
+        int sw = sr.getScaledWidth();
+        int sh = sr.getScaledHeight();
+        float alpha = blurValor * 0.9f;
 
+        GlStateManager.disableDepth();
+        GlStateManager.depthMask(false);
+        GlStateManager.disableAlpha();
+        GlStateManager.enableTexture2D();
+
+        if (OpenGlHelper.isFramebufferEnabled() && mc.getFramebuffer() != null) {
+            blurModo = "FBO";
+            blurViaFbo(mc, w, h, sw, sh, alpha);
+        } else {
+            blurModo = "COPIA";
+            blurViaCopia(w, h, sw, sh, alpha);
+        }
+
+        GlStateManager.color(1f, 1f, 1f, 1f);
+        GlStateManager.disableBlend();
+        GlStateManager.enableAlpha();
+        GlStateManager.depthMask(true);
+        GlStateManager.enableDepth();
+    }
+
+    // Metodo 1: usa um framebuffer extra do proprio Minecraft
+    private static void blurViaFbo(Minecraft mc, int w, int h, int sw, int sh, float alpha) {
+        Framebuffer principal = mc.getFramebuffer();
+
+        if (blurFbo == null || blurFbo.framebufferWidth != w || blurFbo.framebufferHeight != h) {
+            if (blurFbo != null) blurFbo.deleteFramebuffer();
+            blurFbo = new Framebuffer(w, h, false);
+            blurFbo.setFramebufferFilter(GL11.GL_LINEAR);
+            blurPronto = false;
+        }
+
+        // 1) frame anterior por cima da cena atual, com transparencia
+        if (blurPronto) {
+            GlStateManager.enableBlend();
+            GlStateManager.blendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+            GlStateManager.color(1f, 1f, 1f, alpha);
+            GlStateManager.bindTexture(blurFbo.framebufferTexture);
+            desenharQuad(sw, sh);
+        }
+
+        // 2) guarda o resultado (cena misturada) para o proximo frame
+        blurFbo.bindFramebuffer(true);
+        GlStateManager.disableBlend();
+        GlStateManager.color(1f, 1f, 1f, 1f);
+        GlStateManager.bindTexture(principal.framebufferTexture);
+        desenharQuad(sw, sh);
+
+        // deixa o canal alpha em 1 para a mistura do proximo frame
+        GlStateManager.colorMask(false, false, false, true);
+        GlStateManager.clearColor(0f, 0f, 0f, 1f);
+        GlStateManager.clear(GL11.GL_COLOR_BUFFER_BIT);
+        GlStateManager.colorMask(true, true, true, true);
+
+        principal.bindFramebuffer(true);
+        blurPronto = true;
+    }
+
+    // Metodo 2 (reserva): copia a tela para uma textura
+    private static void blurViaCopia(int w, int h, int sw, int sh, float alpha) {
         if (blurTex == -1) blurTex = GL11.glGenTextures();
 
-        // Primeiro frame (ou tela redimensionada): so captura
         if (!blurPronto || w != blurW || h != blurH) {
             GlStateManager.bindTexture(blurTex);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
@@ -155,39 +232,14 @@ public class MeuClient {
             return;
         }
 
-        ScaledResolution sr = new ScaledResolution(mc);
-        int sw = sr.getScaledWidth();
-        int sh = sr.getScaledHeight();
-        float alpha = blurValor * 0.9f;
-
-        // Desenha o frame anterior por cima, com transparencia
-        GlStateManager.disableDepth();
-        GlStateManager.depthMask(false);
         GlStateManager.enableBlend();
         GlStateManager.blendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GlStateManager.disableAlpha();
-        GlStateManager.enableTexture2D();
         GlStateManager.color(1f, 1f, 1f, alpha);
         GlStateManager.bindTexture(blurTex);
+        desenharQuad(sw, sh);
 
-        Tessellator tess = Tessellator.getInstance();
-        WorldRenderer wr = tess.getWorldRenderer();
-        wr.begin(7, DefaultVertexFormats.POSITION_TEX);
-        wr.pos(0, sh, 0).tex(0, 0).endVertex();
-        wr.pos(sw, sh, 0).tex(1, 0).endVertex();
-        wr.pos(sw, 0, 0).tex(1, 1).endVertex();
-        wr.pos(0, 0, 0).tex(0, 1).endVertex();
-        tess.draw();
-
-        // Guarda o resultado misturado para o proximo frame
         GlStateManager.bindTexture(blurTex);
         GL11.glCopyTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
-
-        GlStateManager.color(1f, 1f, 1f, 1f);
-        GlStateManager.disableBlend();
-        GlStateManager.enableAlpha();
-        GlStateManager.depthMask(true);
-        GlStateManager.enableDepth();
     }
 
     // ===== HUD =====
@@ -208,6 +260,14 @@ public class MeuClient {
                 String.format("XYZ: %.1f / %.1f / %.1f",
                         mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ),
                 4, y, 0xFFFFFF);
+
+        // Linha de diagnostico do Motion Blur (so aparece quando ele esta ON)
+        if (motionBlur) {
+            y += 11;
+            mc.fontRendererObj.drawStringWithShadow(
+                    "Blur: " + blurModo + (blurPronto ? " ativo" : " aguardando"),
+                    4, y, 0xFFFF55);
+        }
     }
 
     // ===== Menu (classe interna, mesmo arquivo) =====
