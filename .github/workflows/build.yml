@@ -1,0 +1,28 @@
+name: Build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 8
+      - name: Preparar MDK
+        run: |
+          unzip -q *.zip -d mdk
+          D=$(dirname "$(find mdk -name gradlew | head -1)")
+          echo "MDK_DIR=$D" >> $GITHUB_ENV
+          rm -rf "$D"/src/main/java/*
+          mkdir -p "$D"/src/main/java/com/exemplo
+          cp MeuClient.java "$D"/src/main/java/com/exemplo/
+      - name: Compilar
+        working-directory: ${{ env.MDK_DIR }}
+        run: |
+          chmod +x gradlew
+          ./gradlew setupCIWorkspace build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meuclient
+          path: ${{ env.MDK_DIR }}/build/libs/*.jar
